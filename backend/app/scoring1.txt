@@ -1,0 +1,756 @@
+"""
+FortiAccess - Architecture Scoring Engine
+
+This module provides:
+1. AWS-based architecture cost estimation
+2. Workload-aware performance/scalability/security scoring
+3. Budget normalization
+4. Weighted overall architecture scoring
+
+AWS pricing:
+- Uses AWS Price List API through boto3.
+- Pricing region defaults to ap-south-1 (Mumbai).
+- Monthly hours are estimated using 730 hours/month.
+
+IMPORTANT:
+The AWS Price List API provides the price of AWS resources.
+It does NOT automatically know how many resources your workload needs.
+Therefore, FortiAccess uses explicit workload assumptions for each
+architecture and then obtains the relevant AWS prices.
+"""
+
+from functools import lru_cache
+
+import boto3
+
+
+# ============================================================
+# AWS PRICING CONFIGURATION
+# ============================================================
+
+AWS_REGION = "ap-south-1"
+AWS_PRICING_REGION = "us-east-1"
+
+MONTHLY_HOURS = 730
+
+# Human-readable AWS location used by the Pricing API
+AWS_LOCATION = "Asia Pacific (Mumbai)"
+
+
+# ============================================================
+# WORKLOAD / RESOURCE ASSUMPTIONS
+# ============================================================
+
+def get_traffic_multiplier(traffic_level):
+    """
+    Converts traffic level into a relative workload multiplier.
+
+    These values are modeling assumptions, not AWS pricing.
+    They are used to estimate how much capacity a workload requires.
+    """
+
+    return {
+        "low": 0.5,
+        "medium": 1.0,
+        "high": 2.0
+    }.get(traffic_level, 1.0)
+
+
+def estimate_ec2_instances(request):
+    """
+    Estimate the number of EC2 instances required for Architecture A.
+
+    Baseline:
+    - 2 instances for fault tolerance.
+    - Additional capacity is added for larger workloads.
+    """
+
+    users = request.users
+    traffic = request.traffic_level
+
+    traffic_multiplier = get_traffic_multiplier(traffic)
+
+    estimated_load = (users / 50000) * traffic_multiplier
+
+    instances = max(2, int(round(estimated_load * 2)))
+
+    return min(instances, 20)
+
+
+def estimate_ecs_tasks(request):
+    """
+    Estimate ECS tasks for Architecture B.
+
+    Minimum of 2 tasks is maintained for availability.
+    """
+
+    users = request.users
+    traffic = request.traffic_level
+
+    traffic_multiplier = get_traffic_multiplier(traffic)
+
+    estimated_load = (users / 50000) * traffic_multiplier
+
+    tasks = max(2, int(round(estimated_load * 2)))
+
+    return min(tasks, 30)
+
+
+def estimate_lambda_requests(request):
+    """
+    Estimate monthly Lambda invocations.
+
+    This is a modeling assumption based on monthly active users.
+    """
+
+    users = request.users
+    traffic = request.traffic_level
+
+    traffic_multiplier = get_traffic_multiplier(traffic)
+
+    # Assume approximately 20 API requests/user/month
+    requests_per_user = 20
+
+    estimated_requests = (
+        users
+        * requests_per_user
+        * traffic_multiplier
+    )
+
+    return max(1, int(estimated_requests))
+
+
+def estimate_dynamodb_storage_gb(request):
+    """
+    Estimate DynamoDB storage requirement.
+    """
+
+    users = request.users
+
+    # Approximation:
+    # 0.01 GB per 1,000 users
+    storage_gb = max(5, (users / 1000) * 0.01)
+
+    return round(storage_gb, 2)
+
+
+# ============================================================
+# AWS PRICE LIST API
+# ============================================================
+
+@lru_cache(maxsize=128)
+def get_pricing_client():
+    """
+    Create a boto3 AWS Pricing API client.
+
+    AWS Pricing API is available through us-east-1 endpoint,
+    even when pricing is being queried for another AWS region.
+    """
+
+    return boto3.client(
+        "pricing",
+        region_name=AWS_PRICING_REGION
+    )
+
+
+@lru_cache(maxsize=256)
+def get_product_price(service_code, filters):
+    """
+    Query AWS Price List API and return the first matching
+    On-Demand USD price.
+
+    Parameters
+    ----------
+    service_code : str
+        AWS service code, e.g. AmazonEC2.
+
+    filters : tuple
+        Tuple of AWS Pricing API filters.
+
+    Returns
+    -------
+    float
+        Hourly/unit price in USD.
+    """
+
+    client = get_pricing_client()
+
+    response = client.get_products(
+        ServiceCode=service_code,
+        Filters=list(filters),
+        MaxResults=100
+    )
+
+    products = response.get("PriceList", [])
+
+    for product_json in products:
+
+        if isinstance(product_json, str):
+            import json
+            product_json = json.loads(product_json)
+
+        terms = product_json.get("terms", {})
+        on_demand = terms.get("OnDemand", {})
+
+        for term in on_demand.values():
+
+            price_dimensions = term.get(
+                "priceDimensions",
+                {}
+            )
+
+            for dimension in price_dimensions.values():
+
+                price = dimension.get(
+                    "pricePerUnit",
+                    {}
+                ).get("USD")
+
+                if price is not None:
+
+                    try:
+                        return float(price)
+                    except (TypeError, ValueError):
+                        continue
+
+    raise RuntimeError(
+        f"No AWS pricing result found for "
+        f"{service_code} with filters={filters}"
+    )
+
+
+# ============================================================
+# SERVICE PRICE FUNCTIONS
+# ============================================================
+
+def get_ec2_hourly_price(instance_type="t3.medium"):
+    """
+    Get Linux EC2 On-Demand hourly price.
+    """
+
+    filters = (
+        {
+            "Type": "TERM_MATCH",
+            "Field": "regionCode",
+            "Value": AWS_REGION
+        },
+        {
+            "Type": "TERM_MATCH",
+            "Field": "instanceType",
+            "Value": instance_type
+        },
+        {
+            "Type": "TERM_MATCH",
+            "Field": "operatingSystem",
+            "Value": "Linux"
+        },
+        {
+            "Type": "TERM_MATCH",
+            "Field": "tenancy",
+            "Value": "Shared"
+        },
+        {
+            "Type": "TERM_MATCH",
+            "Field": "preInstalledSw",
+            "Value": "NA"
+        },
+        {
+            "Type": "TERM_MATCH",
+            "Field": "capacitystatus",
+            "Value": "Used"
+        }
+    )
+
+    return get_product_price(
+        "AmazonEC2",
+        tuple(
+            (item["Field"], item["Value"])
+            for item in filters
+        )
+    )
+
+
+def get_rds_hourly_price(instance_type="db.t3.medium"):
+    """
+    Get RDS MySQL On-Demand hourly price.
+    """
+
+    filters = (
+        {
+            "Type": "TERM_MATCH",
+            "Field": "regionCode",
+            "Value": AWS_REGION
+        },
+        {
+            "Type": "TERM_MATCH",
+            "Field": "instanceType",
+            "Value": instance_type
+        },
+        {
+            "Type": "TERM_MATCH",
+            "Field": "engineCode",
+            "Value": "21"
+        },
+    )
+
+    try:
+        return get_product_price(
+            "AmazonRDS",
+            tuple(
+                (item["Field"], item["Value"])
+                for item in filters
+            )
+        )
+
+    except Exception:
+        # Fallback query for RDS MySQL pricing.
+        fallback_filters = (
+            {
+                "Type": "TERM_MATCH",
+                "Field": "regionCode",
+                "Value": AWS_REGION
+            },
+            {
+                "Type": "TERM_MATCH",
+                "Field": "instanceType",
+                "Value": instance_type
+            },
+            {
+                "Type": "TERM_MATCH",
+                "Field": "databaseEngine",
+                "Value": "MySQL"
+            },
+        )
+
+        return get_product_price(
+            "AmazonRDS",
+            tuple(
+                (item["Field"], item["Value"])
+                for item in fallback_filters
+            )
+        )
+
+
+# ============================================================
+# ARCHITECTURE COST CALCULATION
+# ============================================================
+
+def calculate_cost(architecture_id, request):
+    """
+    Calculate estimated monthly infrastructure cost.
+
+    Architecture A:
+        CloudFront
+        ALB
+        EC2
+        RDS
+
+    Architecture B:
+        CloudFront
+        ALB
+        ECS/Fargate
+        RDS
+
+    Architecture C:
+        CloudFront
+        API Gateway
+        Lambda
+        DynamoDB
+
+    The AWS Price List API is used for resource pricing.
+    Workload-to-resource conversion is based on explicit
+    FortiAccess assumptions.
+    """
+
+    try:
+
+        # ----------------------------------------------------
+        # ARCHITECTURE A
+        # ----------------------------------------------------
+
+        if architecture_id == "A":
+
+            ec2_instances = estimate_ec2_instances(request)
+
+            ec2_price = get_ec2_hourly_price(
+                "t3.medium"
+            )
+
+            rds_price = get_rds_hourly_price(
+                "db.t3.medium"
+            )
+
+            ec2_monthly = (
+                ec2_instances
+                * ec2_price
+                * MONTHLY_HOURS
+            )
+
+            rds_monthly = (
+                rds_price
+                * MONTHLY_HOURS
+            )
+
+            # Approximate shared-service allowance for:
+            # ALB + CloudFront + data transfer.
+            shared_services = 40.0
+
+            total = (
+                ec2_monthly
+                + rds_monthly
+                + shared_services
+            )
+
+        # ----------------------------------------------------
+        # ARCHITECTURE B
+        # ----------------------------------------------------
+
+        elif architecture_id == "B":
+
+            # Fargate pricing varies by CPU/memory.
+            # For this first production model, use a
+            # clearly documented task-cost assumption.
+            tasks = estimate_ecs_tasks(request)
+
+            # Approximate 0.5 vCPU / 1 GB task.
+            # This value will be replaced by exact Fargate
+            # Price List API lookup in the next refinement.
+            fargate_hourly_estimate = 0.055
+
+            rds_price = get_rds_hourly_price(
+                "db.t3.medium"
+            )
+
+            ecs_monthly = (
+                tasks
+                * fargate_hourly_estimate
+                * MONTHLY_HOURS
+            )
+
+            rds_monthly = (
+                rds_price
+                * MONTHLY_HOURS
+            )
+
+            shared_services = 45.0
+
+            total = (
+                ecs_monthly
+                + rds_monthly
+                + shared_services
+            )
+
+        # ----------------------------------------------------
+        # ARCHITECTURE C
+        # ----------------------------------------------------
+
+        elif architecture_id == "C":
+
+            lambda_requests = estimate_lambda_requests(
+                request
+            )
+
+            dynamodb_storage = estimate_dynamodb_storage_gb(
+                request
+            )
+
+            # Lambda:
+            # Assumption = 512 MB memory, 200 ms average duration.
+            lambda_gb_seconds = (
+                lambda_requests
+                * 0.512
+                * 0.2
+            )
+
+            # AWS Lambda approximate On-Demand compute price.
+            lambda_compute_price = 0.0000166667
+
+            lambda_monthly = (
+                lambda_gb_seconds
+                * lambda_compute_price
+            )
+
+            # Lambda request charge approximation.
+            lambda_request_price = (
+                lambda_requests / 1_000_000
+            ) * 0.20
+
+            # DynamoDB:
+            # Explicit modeling assumption for this first version.
+            dynamodb_storage_price = (
+                dynamodb_storage
+                * 0.25
+            )
+
+            # API Gateway + CloudFront allowance.
+            api_gateway_price = (
+                lambda_requests / 1_000_000
+            ) * 3.50
+
+            cloudfront_allowance = 10.0
+
+            total = (
+                lambda_monthly
+                + lambda_request_price
+                + dynamodb_storage_price
+                + api_gateway_price
+                + cloudfront_allowance
+            )
+
+        else:
+
+            raise ValueError(
+                f"Unknown architecture ID: {architecture_id}"
+            )
+
+        return round(max(total, 0), 2)
+
+    except Exception as exc:
+
+        raise RuntimeError(
+            f"AWS pricing calculation failed for "
+            f"architecture {architecture_id}: {exc}"
+        ) from exc
+
+
+# ============================================================
+# WORKLOAD-AWARE ARCHITECTURE SCORES
+# ============================================================
+
+def calculate_scores(architecture_id, request):
+    """
+    Calculate workload-aware scores.
+
+    Scores are normalized to 0-100.
+
+    These are currently architecture capability scores,
+    adjusted by workload characteristics.
+
+    They are intentionally separated from cost so that
+    the research model can later replace these formulas
+    with benchmark-derived measurements.
+    """
+
+    users = request.users
+    traffic = request.traffic_level
+    sensitivity = request.data_sensitivity
+
+    traffic_multiplier = get_traffic_multiplier(
+        traffic
+    )
+
+    # --------------------------------------------------------
+    # BASELINE CAPABILITY
+    # --------------------------------------------------------
+
+    baseline = {
+        "A": {
+            "performance": 82,
+            "scalability": 75,
+            "availability": 85,
+            "security": 82
+        },
+        "B": {
+            "performance": 88,
+            "scalability": 90,
+            "availability": 90,
+            "security": 87
+        },
+        "C": {
+            "performance": 80,
+            "scalability": 96,
+            "availability": 92,
+            "security": 85
+        }
+    }
+
+    scores = baseline[architecture_id].copy()
+
+    # --------------------------------------------------------
+    # WORKLOAD ADJUSTMENTS
+    # --------------------------------------------------------
+
+    # Larger workloads increase the importance of scalable
+    # architectures.
+    if users >= 100000:
+
+        if architecture_id == "A":
+            scores["scalability"] -= 5
+
+        elif architecture_id == "B":
+            scores["scalability"] += 2
+
+        elif architecture_id == "C":
+            scores["scalability"] += 3
+
+    # High traffic places greater pressure on performance.
+    if traffic == "high":
+
+        if architecture_id == "A":
+            scores["performance"] -= 3
+
+        elif architecture_id == "B":
+            scores["performance"] += 2
+
+        elif architecture_id == "C":
+            scores["performance"] += 1
+
+    # High-sensitivity workloads increase the importance of
+    # security controls.
+    if sensitivity == "high":
+
+        if architecture_id == "A":
+            scores["security"] -= 1
+
+        elif architecture_id == "B":
+            scores["security"] += 1
+
+        elif architecture_id == "C":
+            scores["security"] += 1
+
+    # --------------------------------------------------------
+    # CLAMP TO 0-100
+    # --------------------------------------------------------
+
+    for dimension in scores:
+
+        scores[dimension] = max(
+            0,
+            min(
+                100,
+                scores[dimension]
+            )
+        )
+
+    return scores
+
+
+# ============================================================
+# NORMALIZED BUDGET SCORE
+# ============================================================
+
+def calculate_budget_score(cost, budget):
+    """
+    Convert estimated monthly cost into a 0-100 score.
+
+    Interpretation:
+
+    cost <= 50% of budget:
+        100
+
+    cost == budget:
+        50
+
+    cost >= 2x budget:
+        0
+    """
+
+    if cost <= 0:
+        return 100
+
+    if budget <= 0:
+        return 0
+
+    ratio = cost / budget
+
+    score = 100 - (ratio * 50)
+
+    return round(
+        max(
+            0,
+            min(
+                100,
+                score
+            )
+        ),
+        2
+    )
+
+
+# ============================================================
+# OVERALL SCORE
+# ============================================================
+
+def calculate_overall_score(
+    cost,
+    scores,
+    request
+):
+    """
+    Calculate final multi-objective architecture score.
+
+    Higher score = better architecture.
+
+    Dimensions:
+        Cost
+        Performance
+        Scalability
+        Availability
+        Security
+
+    User-configurable priorities:
+        performance_priority
+        scalability_priority
+        security_priority
+
+    Availability and cost currently have fixed baseline
+    weights of 3.
+
+    Final score is normalized to 0-100.
+    """
+
+    budget_score = calculate_budget_score(
+        cost,
+        request.monthly_budget
+    )
+
+    performance_weight = request.performance_priority
+    scalability_weight = request.scalability_priority
+    security_weight = request.security_priority
+
+    availability_weight = 3
+    cost_weight = 3
+
+    total_weight = (
+        performance_weight
+        + scalability_weight
+        + security_weight
+        + availability_weight
+        + cost_weight
+    )
+
+    if total_weight <= 0:
+        return 0.0
+
+    weighted_score = (
+        scores["performance"]
+        * performance_weight
+
+        + scores["scalability"]
+        * scalability_weight
+
+        + scores["security"]
+        * security_weight
+
+        + scores["availability"]
+        * availability_weight
+
+        + budget_score
+        * cost_weight
+    )
+
+    overall = (
+        weighted_score
+        / total_weight
+    )
+
+    return round(
+        max(
+            0,
+            min(
+                100,
+                overall
+            )
+        ),
+        2
+    )

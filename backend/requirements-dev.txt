@@ -1,0 +1,4 @@
+-r requirements.txt
+httpx
+python-hcl2
+ruff
